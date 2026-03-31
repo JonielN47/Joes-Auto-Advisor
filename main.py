@@ -65,7 +65,7 @@ def handle_sms():
                 "Content-Type": "application/json"
             },
             data=json.dumps({
-                "model": "stepfun/step-3-5-flash:free",
+                "model": "stepfun/step-3.5-flash:free",
                 "messages": [
                     {"role": "system", "content": f"{SYSTEM_PROMPT}\nContext: {context}"},
                     {"role": "user", "content": incoming_msg}
