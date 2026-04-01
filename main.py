@@ -77,7 +77,7 @@ def handle_sms():
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
         json={
-            "model": "stepfun/step-3.5", # Your requested Stepfun brain
+            "model": "stepfun/step-3.5-flash: free", # Your requested Stepfun brain
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": msg}
