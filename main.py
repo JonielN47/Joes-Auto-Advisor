@@ -5,7 +5,9 @@ from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta
+from supabase import create_client
 import pytz
+from dateutil import parser
 
 app = Flask(__name__)
 
@@ -14,100 +16,104 @@ TIMEZONE = pytz.timezone("America/New_York")
 BOOKING_TAG = "CONFIRMED_BOOKING"
 LEAD_TAG = "LEAD_CAPTURED"
 
+# Initialize Supabase
+supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
+
 def get_calendar_service():
-    # Uses the Secret JSON key you put in Render
-    service_account_info = json.loads(os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))
-    creds = service_account.Credentials.from_service_account_info(service_account_info)
+    info = json.loads(os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))
+    creds = service_account.Credentials.from_service_account_info(info)
     return build('calendar', 'v3', credentials=creds)
 
 def is_slot_available(start_time):
     """Checks if Joe is already busy during the requested hour."""
     service = get_calendar_service()
     end_time = start_time + timedelta(hours=1)
-    
     events_result = service.events().list(
         calendarId=os.environ.get('GOOGLE_CALENDAR_ID'),
         timeMin=start_time.isoformat(),
         timeMax=end_time.isoformat(),
         singleEvents=True
     ).execute()
-    
     return len(events_result.get('items', [])) == 0
 
-def create_booking(summary, start_time):
+def create_booking(summary, start_time, phone):
     service = get_calendar_service()
     end_time = start_time + timedelta(hours=1)
     event = {
         'summary': f"🚗 {summary}",
         'location': '510 North Reading Road, Ephrata, PA 17522',
-        'description': 'Scheduled by Current Auto Bot',
+        'description': f'Customer: {phone}\nScheduled by AI Bot',
         'start': {'dateTime': start_time.isoformat(), 'timeZone': 'America/New_York'},
         'end': {'dateTime': end_time.isoformat(), 'timeZone': 'America/New_York'},
     }
     service.events().insert(calendarId=os.environ.get('GOOGLE_CALENDAR_ID'), body=event).execute()
+    
+    # Also save to Supabase 'bookings' table
+    supabase.table('bookings').insert({
+        "customer_phone": phone,
+        "appointment_time": start_time.isoformat(),
+        "service_type": summary
+    }).execute()
 
 @app.route('/sms', methods=['POST', 'GET'])
 def handle_sms():
     data = request.json if request.method == 'POST' else request.args
     msg = data.get('message', '')
     num = data.get('number', '')
-    
-    # Get current time for the AI's awareness
     now = datetime.now(TIMEZONE)
     
-    # --- STEPFUN BRAIN PROMPT ---
+    # --- STEPFUN SYSTEM PROMPT ---
     system_prompt = f"""
-    You are the AI Assistant for Current Auto Care in Ephrata, PA.
-    SHOP INFO: 30+ years experience. Located at 510 N Reading Rd.
+    You are the AI Assistant for Current Auto Care in Ephrata, PA. 
+    30+ years experience. 510 N Reading Rd.
     HOURS: Mon-Fri 7:00 AM - 5:30 PM. CLOSED Weekends.
     SERVICES: PA Inspections, Trailer Inspections, Fleet Services, Brakes, AC, Engine Repair.
     
     CURRENT TIME: {now.strftime('%A, %I:%M %p')}
     
-    GOAL: 
+    GOAL:
     1. Collect Name, Car, and Issue.
-    2. If you have Name/Car/Issue, add [{LEAD_TAG}] to your internal log.
-    3. To book, use exactly: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS].
-    4. ONLY book during Mon-Fri 7:00 AM - 5:30 PM. If they ask for after-hours, suggest the next morning.
+    2. Add [{LEAD_TAG}] if you have their car/issue info.
+    3. To book, use: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS].
+    4. ONLY book during business hours. Suggest next business day if they ask for after-hours.
     """
 
-    # --- OPENROUTER CALL (Using Stepfun) ---
+    # Call OpenRouter with Stepfun
     api_key = os.environ.get("OPENROUTER_API_KEY")
-    response = requests.post(
+    ai_resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
         json={
-            "model": "stepfun/step-3.5-flash: free", # Your requested Stepfun brain
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": msg}
-            ]
+            "model": "stepfun/step-3.5-flash: free",
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": msg}]
         }
-    )
+    ).json()
     
-    bot_reply = response.json()['choices'][0]['message']['content']
+    bot_reply = ai_resp['choices'][0]['message']['content']
 
     # --- THE GATEKEEPER LOGIC ---
     if BOOKING_TAG in bot_reply:
         try:
-            # Extract the ISO time from the AI's response
             time_str = bot_reply.split(f"{BOOKING_TAG}: ")[1].split(']')[0]
-            req_time = datetime.fromisoformat(time_str).replace(tzinfo=TIMEZONE)
+            req_time = parser.parse(time_str).replace(tzinfo=TIMEZONE)
             
-            # CHECK FOR DOUBLE BOOKING
             if is_slot_available(req_time):
-                create_booking(f"Appt: {num}", req_time)
-                final_reply = bot_reply.split('[')[0] + " \n\n✅ I've got you scheduled! See you at 510 N Reading Rd."
+                create_booking(f"Appt for {num}", req_time, num)
+                final_reply = bot_reply.split('[')[0] + " \n\n✅ You're booked for " + req_time.strftime('%b %d at %I:%M %p') + "!"
             else:
-                final_reply = "I'm sorry, that specific time was just taken! Is there another slot between 7:00 and 5:30 that works for you?"
+                final_reply = "That slot is actually taken! Is there another time that works for you?"
         except Exception as e:
-            print(f"Booking Error: {e}")
-            final_reply = "I'm having a quick look at the calendar—one second while I confirm that time for you."
+            print(f"Error: {e}")
+            final_reply = "I had a glitch with the calendar, but I'm checking that time for you now!"
     else:
-        final_reply = bot_reply.replace(f"[{LEAD_TAG}]", "")
+        # Check for Lead Tag
         if LEAD_TAG in bot_reply:
-            print(f"🔥 LEAD CAPTURED: {num} for {msg}")
+            supabase.table('leads').insert({"phone_number": num, "issue": msg}).execute()
+        final_reply = bot_reply.replace(f"[{LEAD_TAG}]", "")
 
-    # PING THE TABLET
+    # PING TABLET
     requests.get(os.environ.get("MACRODROID_URL"), params={"number": num, "text": final_reply})
     return "OK", 200
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
