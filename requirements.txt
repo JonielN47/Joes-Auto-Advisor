@@ -2,3 +2,6 @@ flask
 supabase
 requests
 gunicorn
+pytz
+google-api-python-client
+google-auth
