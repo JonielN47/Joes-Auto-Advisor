@@ -32,12 +32,14 @@ def is_slot_available(start_time):
     """Checks if the 1-hour slot is free on Joe's calendar."""
     service = get_calendar_service()
     end_time = start_time + timedelta(hours=1)
+    
     events_result = service.events().list(
         calendarId=os.environ.get('GOOGLE_CALENDAR_ID'),
         timeMin=start_time.isoformat(),
         timeMax=end_time.isoformat(),
         singleEvents=True
     ).execute()
+    
     return len(events_result.get('items', [])) == 0
 
 def create_booking(summary, start_time, phone):
@@ -45,7 +47,7 @@ def create_booking(summary, start_time, phone):
     service = get_calendar_service()
     end_time = start_time + timedelta(hours=1)
     
-    # 1. Update Google Calendar
+    # 1. Update Google Calendar (location/description match current requirements)
     event = {
         'summary': f"🚗 {summary}",
         'location': '510 North Reading Road, Ephrata, PA 17522',
@@ -65,14 +67,14 @@ def create_booking(summary, start_time, phone):
 
 @app.route('/sms', methods=['POST', 'GET'])
 def handle_sms():
-    print("🔔 DOORBELL: Request received from tablet.")
+    print("🔔 DOORBELL: Request received.")
     data = request.json if request.method == 'POST' else request.args
     msg = data.get('message', '')
     num = data.get('number', '')
     
     if not msg: return "OK", 200
 
-    # 1. MEMORY: Save User message to Supabase
+    # 1. MEMORY: Save User message to Supabase 'messages' table
     try:
         supabase.table('messages').insert({"phone_number": num, "role": "user", "content": msg}).execute()
     except: pass
@@ -83,7 +85,8 @@ def handle_sms():
 
     now = datetime.now(TIMEZONE)
     
-    # 3. SYSTEM PROMPT (Tells AI how to use the 'Pipe' for service names)
+    # 3. REINFORCED SYSTEM PROMPT (Incorporate Hours/Services/Stepfun instructions)
+    # Strengthened the lead tag for non-confirmed bookings
     system_prompt = f"""
     You are the AI Assistant for Current Auto Care in Ephrata, PA. 
     SHOP INFO: 30+ years experience. 510 N Reading Rd.
@@ -94,12 +97,12 @@ def handle_sms():
     
     GOAL:
     1. Collect Name, Car, and Issue.
-    2. Add [{LEAD_TAG}] once you have car/issue info.
+    2. Once you have Name/Car/Issue, provide a clean lead tag: [{LEAD_TAG}: Name | Vehicle | Issue].
+       Generate this tag even if they haven't picked a time yet (for follow-up).
     3. To book, use exactly: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS | Service Name]
-    Example: [{BOOKING_TAG}: 2026-04-05T09:00:00 | Brake Inspection]
     """
 
-    # 4. CALL AI (Step 3.5 Flash)
+    # 4. CALL AI (Step 3.5 Flash Free)
     api_key = os.environ.get("OPENROUTER_API_KEY")
     ai_resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -113,7 +116,7 @@ def handle_sms():
     bot_reply = ai_resp['choices'][0]['message']['content']
     print(f"💬 AI REPLY: {bot_reply}")
 
-    # 5. MEMORY: Save AI reply to Supabase
+    # 5. MEMORY: Save AI reply to Supabase 'messages'
     try:
         supabase.table('messages').insert({"phone_number": num, "role": "assistant", "content": bot_reply}).execute()
     except: pass
@@ -134,12 +137,19 @@ def handle_sms():
                 time_str = tag_content
                 service_name = "General Service"
 
+            # Parse with 'fuzzy=True' to prevent defaulting to 'now' on minor format errors
             req_time = parser.parse(time_str, fuzzy=True).replace(tzinfo=TIMEZONE)
             
+            # 🔧 THE MINUTE ERASER FIX: Explicitly force the minute/second to zero
+            # This solves the ":56 AM" issue seen on the calendar
+            req_time = req_time.replace(minute=0, second=0, microsecond=0)
+            
+            print(f"✅ DEBUG: Final Parsed Hourly Time for Google: {req_time.isoformat()}")
+
             if is_slot_available(req_time):
                 create_booking(f"{service_name} - {num}", req_time, num)
                 final_reply = bot_reply.split('[')[0] + f" \n\n✅ Scheduled for {req_time.strftime('%b %d at %I:%M %p')}!"
-                # Optional: Clear memory after successful booking to keep it fresh
+                # Clear conversation memory after successful booking (keep it light)
                 supabase.table('messages').delete().eq("phone_number", num).execute()
             else:
                 final_reply = "I'm sorry, that specific slot was just taken. Is there another time that works for you?"
@@ -150,13 +160,16 @@ def handle_sms():
     elif LEAD_TAG in bot_reply:
         try:
             # Save to Supabase 'leads' table (matches column 'issue')
+            # Image_4.png shows this raw capture works, but we'll soon refine it to use extracted Name/Car/Issue
             supabase.table('leads').insert({"phone_number": num, "issue": msg}).execute()
-            print(f"🔥 LEAD CAPTURED: {num}")
+            print(f"🔥 LEAD CAPTURED: {num} for non-confirmed appt")
         except Exception as e:
             print(f"❌ SUPABASE LEAD ERROR: {e}")
-        final_reply = bot_reply.replace(f"[{LEAD_TAG}]", "")
+        # Strip the lead tag from the public reply
+        # Handle new lead tag structure [LEAD_CAPTURED: Name | Vehicle | Issue]
+        final_reply = bot_reply.split('[')[0].strip()
 
-    # PING TABLET
+    # PING TABLET (MacroDroid)
     requests.get(os.environ.get("MACRODROID_URL"), params={"number": num, "text": final_reply})
     return "OK", 200
 
