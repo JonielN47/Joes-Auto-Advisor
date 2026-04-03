@@ -15,14 +15,10 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 TIMEZONE = pytz.timezone("America/New_York")
 BOOKING_TAG = "CONFIRMED_BOOKING"
-LEAD_TAG = "LEAD_CAPTURED"
+DATA_TAG = "INTERNAL_DATA" # New hidden tag for incremental saving
 
 # Initialize Supabase
-try:
-    supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
-    print("✅ Supabase Client Connected")
-except Exception as e:
-    print(f"❌ Supabase Connection Error: {e}")
+supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
 def get_calendar_service():
     info = json.loads(os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))
@@ -30,20 +26,19 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 def get_free_slots():
-    """Scans the next 10 days for a spread of open slots across the week."""
+    """Scans every business hour for the next 10 days to show the AI a full menu."""
     service = get_calendar_service()
     now = datetime.now(TIMEZONE)
     slots = []
     
-    # Scan 10 days ahead to give the customer a full week of options
     for i in range(11):
         check_date = now + timedelta(days=i)
         if check_date.weekday() >= 5: continue # Skip weekends
         
-        # Check slots at 8 AM, 10 AM, 1 PM, and 3 PM to give a variety
-        for hour in [8, 10, 13, 15]:
+        # Scan every hour from 7 AM to 4 PM
+        for hour in range(7, 17):
             start = check_date.replace(hour=hour, minute=0, second=0, microsecond=0)
-            if start < now + timedelta(hours=2): continue # Give Joe 2 hours notice
+            if start < now + timedelta(hours=1): continue 
             
             end = start + timedelta(hours=1)
             events = service.events().list(
@@ -55,7 +50,7 @@ def get_free_slots():
             
             if not events:
                 slots.append(start.strftime('%a, %b %d at %I:%M %p'))
-            if len(slots) >= 6: return slots
+            if len(slots) >= 12: return slots # Give AI 12 choices across the week
     return slots
 
 def create_booking(summary, start_time, phone):
@@ -74,40 +69,39 @@ def create_booking(summary, start_time, phone):
     }).execute()
 
 def clean_tags(text):
-    return re.sub(r'\[.*?\]', '', text).strip()
+    """Surgically removes both booking and data tags."""
+    text = re.sub(r'\[CONFIRMED_BOOKING:.*?\]', '', text)
+    text = re.sub(r'\[INTERNAL_DATA:.*?\]', '', text)
+    return text.strip()
 
 @app.route('/sms', methods=['POST', 'GET'])
 def handle_sms():
-    print("🔔 DOORBELL: Request received.")
     data = request.json if request.method == 'POST' else request.args
     msg, num = data.get('message', ''), data.get('number', '')
     if not msg: return "OK", 200
 
-    # 1. Memory & Context
+    # 1. Store Message
     supabase.table('messages').insert({"phone_number": num, "role": "user", "content": msg}).execute()
+    
+    # 2. Context & Availability
     history = supabase.table('messages').select("role, content").eq("phone_number", num).order("created_at", desc=True).limit(10).execute()
     chat_history = [{"role": h['role'], "content": h['content']} for h in reversed(history.data)]
-
-    # 2. Get Real-Time Availability (Spread across the week)
     available_slots = get_free_slots()
     slots_str = "\n- ".join(available_slots)
 
     now = datetime.now(TIMEZONE)
     system_prompt = f"""
-    You are the Senior Service Advisor for Current Auto Care (30+ yrs experience).
+    You are the Senior Service Advisor for Current Auto Care.
     SHOP: 510 N Reading Rd, Ephrata. HOURS: Mon-Fri 7am-5:30pm.
     CURRENT TIME: {now.strftime('%A, %b %d, %I:%M %p')}
 
-    GOAL:
-    1. Help the customer book an appointment. You can book up to 2 weeks in advance.
-    2. Collect Name, Year, Make, Model, and Issue.
-    3. Once you have info, use: [{LEAD_TAG}: Name | Year | Make | Model | Issue]
-    4. To book, use: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS | Service Name]
-    
-    AVAILABILITY EXAMPLES (Offer these, but you can book any Mon-Fri slot):
-    - {slots_str}
-    
-    If they ask for a day not in the examples, check if it's a weekday and suggest a time (8am, 10am, 1pm, 3pm).
+    INSTRUCTIONS:
+    1. Every time you learn something (Name, Year, Make, Model, or Issue), you MUST include this hidden tag at the END of your message:
+       [{DATA_TAG}: Name | Year | Make | Model | Issue]
+       Use 'None' for info you don't have yet.
+    2. Suggest from these openings, but you can book ANY weekday hour 7am-4pm:
+       - {slots_str}
+    3. To finalize a booking, use: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS | Service Name]
     """
 
     # 3. Call OpenAI
@@ -118,47 +112,50 @@ def handle_sms():
         json={
             "model": "gpt-4o-mini",
             "messages": [{"role": "system", "content": system_prompt}] + chat_history,
-            "temperature": 0.5
-        },
-        timeout=15
+            "temperature": 0.4
+        }
     ).json()
     
     bot_reply = ai_resp['choices'][0]['message']['content']
     print(f"💬 AI REPLY: {bot_reply}")
 
-    # 4. The Logic Gatekeeper
-    final_reply = clean_tags(bot_reply)
+    # 4. Handle Incremental Data (The Supabase Fix)
+    if DATA_TAG in bot_reply:
+        try:
+            raw_data = bot_reply.split(f"{DATA_TAG}: ")[1].split(']')[0].strip()
+            p = [i.strip() for i in raw_data.split("|")]
+            
+            # This logic updates existing leads or creates new ones
+            lead_payload = {
+                "phone_number": num,
+                "customer_name": p[0] if p[0] != "None" else None,
+                "year": p[1] if p[1] != "None" else None,
+                "make": p[2] if p[2] != "None" else None,
+                "model": p[3] if p[3] != "None" else None,
+                "issue": p[4] if p[4] != "None" else None
+            }
+            # Remove None values so we don't overwrite good data with "None"
+            lead_payload = {k: v for k, v in lead_payload.items() if v is not None}
+            
+            # UPSERT: Update if phone exists, otherwise insert
+            supabase.table('leads').upsert(lead_payload, on_conflict='phone_number').execute()
+            print(f"💾 Incremental Lead Update for {num}")
+        except Exception as e:
+            print(f"❌ DATA SYNC ERROR: {e}")
 
+    # 5. Handle Final Booking
+    final_reply = clean_tags(bot_reply)
     if BOOKING_TAG in bot_reply:
         try:
             tag = bot_reply.split(f"{BOOKING_TAG}: ")[1].split(']')[0].strip()
             time_str, svc = tag.split("|") if "|" in tag else (tag, "Repair")
             req_time = parser.parse(time_str.strip(), fuzzy=True).replace(tzinfo=TIMEZONE).replace(minute=0, second=0)
             create_booking(f"{svc.strip()} - {num}", req_time, num)
-            final_reply += f" \n\n✅ You're all set for {req_time.strftime('%b %d at %I:%M %p')}!"
+            final_reply += f" \n\n✅ I've got you down for {req_time.strftime('%b %d at %I:%M %p')}!"
             supabase.table('messages').delete().eq("phone_number", num).execute()
-        except Exception as e:
-            print(f"❌ BOOKING ERROR: {e}")
-            
-    elif LEAD_TAG in bot_reply:
-        try:
-            lead_content = bot_reply.split(f"{LEAD_TAG}: ")[1].split(']')[0].strip()
-            p = [i.strip() for i in lead_content.split("|")]
-            
-            # Robust Parsing: Fill missing parts with "Unknown" so it doesn't crash
-            supabase.table('leads').insert({
-                "customer_name": p[0] if len(p) > 0 else "Unknown",
-                "phone_number": num,
-                "year": p[1] if len(p) > 1 else "Unknown",
-                "make": p[2] if len(p) > 2 else "Unknown",
-                "model": p[3] if len(p) > 3 else "Unknown",
-                "issue": p[4] if len(p) > 4 else msg
-            }).execute()
-            print(f"🔥 LEAD SAVED: {p[0]}")
-        except Exception as e:
-            print(f"❌ LEAD SAVE ERROR: {e}")
+        except: pass
 
-    # 5. Final Send
+    # 6. Final Sync & Send
     supabase.table('messages').insert({"phone_number": num, "role": "assistant", "content": final_reply}).execute()
     requests.get(os.environ.get("MACRODROID_URL"), params={"number": num, "text": final_reply})
     return "OK", 200
