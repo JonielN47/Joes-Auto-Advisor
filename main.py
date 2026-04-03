@@ -32,14 +32,12 @@ def is_slot_available(start_time):
     """Checks if the 1-hour slot is free on Joe's calendar."""
     service = get_calendar_service()
     end_time = start_time + timedelta(hours=1)
-    
     events_result = service.events().list(
         calendarId=os.environ.get('GOOGLE_CALENDAR_ID'),
         timeMin=start_time.isoformat(),
         timeMax=end_time.isoformat(),
         singleEvents=True
     ).execute()
-    
     return len(events_result.get('items', [])) == 0
 
 def create_booking(summary, start_time, phone):
@@ -47,7 +45,6 @@ def create_booking(summary, start_time, phone):
     service = get_calendar_service()
     end_time = start_time + timedelta(hours=1)
     
-    # 1. Update Google Calendar (location/description match current requirements)
     event = {
         'summary': f"🚗 {summary}",
         'location': '510 North Reading Road, Ephrata, PA 17522',
@@ -56,9 +53,8 @@ def create_booking(summary, start_time, phone):
         'end': {'dateTime': end_time.isoformat(), 'timeZone': 'America/New_York'},
     }
     service.events().insert(calendarId=os.environ.get('GOOGLE_CALENDAR_ID'), body=event).execute()
-    print(f"📅 Calendar Updated: {summary}")
-
-    # 2. Update Supabase 'bookings' table
+    
+    # Save to original bookings table
     supabase.table('bookings').insert({
         "customer_phone": phone,
         "appointment_time": start_time.isoformat(),
@@ -74,35 +70,30 @@ def handle_sms():
     
     if not msg: return "OK", 200
 
-    # 1. MEMORY: Save User message to Supabase 'messages' table
+    # 1. MEMORY: Save User message
     try:
         supabase.table('messages').insert({"phone_number": num, "role": "user", "content": msg}).execute()
     except: pass
 
-    # 2. MEMORY: Fetch last 5 messages for context
+    # 2. MEMORY: Fetch context (Last 5 messages)
     history_data = supabase.table('messages').select("role, content").eq("phone_number", num).order("created_at", desc=True).limit(5).execute()
     chat_history = [{"role": h['role'], "content": h['content']} for h in reversed(history_data.data)]
 
     now = datetime.now(TIMEZONE)
     
-    # 3. REINFORCED SYSTEM PROMPT (Incorporate Hours/Services/Stepfun instructions)
-    # Strengthened the lead tag for non-confirmed bookings
+    # 3. SYSTEM PROMPT: Enhanced for better lead/booking parsing
     system_prompt = f"""
     You are the AI Assistant for Current Auto Care in Ephrata, PA. 
-    SHOP INFO: 30+ years experience. 510 N Reading Rd.
     HOURS: Mon-Fri 7:00 AM - 5:30 PM. CLOSED Weekends.
-    SERVICES: PA Inspections, Trailer Inspections, Fleet Services, Brakes, AC, Engine Repair.
-    
     CURRENT TIME: {now.strftime('%A, %Y-%m-%d %I:%M %p')}
     
     GOAL:
     1. Collect Name, Car, and Issue.
-    2. Once you have Name/Car/Issue, provide a clean lead tag: [{LEAD_TAG}: Name | Vehicle | Issue].
-       Generate this tag even if they haven't picked a time yet (for follow-up).
-    3. To book, use exactly: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS | Service Name]
+    2. Once you have Name/Car/Issue, add this tag: [{LEAD_TAG}: Name | Vehicle | Issue].
+    3. To book, use: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS | Service Name]
     """
 
-    # 4. CALL AI (Step 3.5 Flash Free)
+    # 4. CALL AI (Step 3.5 Flash)
     api_key = os.environ.get("OPENROUTER_API_KEY")
     ai_resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -114,62 +105,50 @@ def handle_sms():
     ).json()
     
     bot_reply = ai_resp['choices'][0]['message']['content']
-    print(f"💬 AI REPLY: {bot_reply}")
 
-    # 5. MEMORY: Save AI reply to Supabase 'messages'
+    # 5. MEMORY: Save AI reply
     try:
         supabase.table('messages').insert({"phone_number": num, "role": "assistant", "content": bot_reply}).execute()
     except: pass
 
-    # --- THE IMPROVED LOGIC GATEKEEPER ---
+    # --- LOGIC GATEKEEPER ---
     final_reply = bot_reply
     
     if BOOKING_TAG in bot_reply:
         try:
-            # Parse: [CONFIRMED_BOOKING: TIME | SERVICE]
             tag_content = bot_reply.split(f"{BOOKING_TAG}: ")[1].split(']')[0].strip()
+            time_str, service_name = tag_content.split("|") if "|" in tag_content else (tag_content, "General Service")
             
-            if "|" in tag_content:
-                time_str, service_name = tag_content.split("|")
-                time_str = time_str.strip()
-                service_name = service_name.strip()
-            else:
-                time_str = tag_content
-                service_name = "General Service"
-
-            # Parse with 'fuzzy=True' to prevent defaulting to 'now' on minor format errors
-            req_time = parser.parse(time_str, fuzzy=True).replace(tzinfo=TIMEZONE)
+            req_time = parser.parse(time_str.strip(), fuzzy=True).replace(tzinfo=TIMEZONE)
             
-            # 🔧 THE MINUTE ERASER FIX: Explicitly force the minute/second to zero
-            # This solves the ":56 AM" issue seen on the calendar
+            # 🔧 THE MINUTE ERASER: Force minutes to :00
             req_time = req_time.replace(minute=0, second=0, microsecond=0)
             
-            print(f"✅ DEBUG: Final Parsed Hourly Time for Google: {req_time.isoformat()}")
-
             if is_slot_available(req_time):
-                create_booking(f"{service_name} - {num}", req_time, num)
+                create_booking(f"{service_name.strip()} - {num}", req_time, num)
                 final_reply = bot_reply.split('[')[0] + f" \n\n✅ Scheduled for {req_time.strftime('%b %d at %I:%M %p')}!"
-                # Clear conversation memory after successful booking (keep it light)
+                # Clear memory after booking
                 supabase.table('messages').delete().eq("phone_number", num).execute()
             else:
-                final_reply = "I'm sorry, that specific slot was just taken. Is there another time that works for you?"
-        except Exception as e:
-            print(f"❌ BOOKING ERROR: {e}")
-            final_reply = "I'm having a quick look at the calendar—one second while I confirm that time for you."
-    
+                final_reply = "I'm sorry, that slot was just taken. Is there another time that works?"
+        except: final_reply = bot_reply.split('[')[0]
+
     elif LEAD_TAG in bot_reply:
         try:
-            # Save to Supabase 'leads' table (matches column 'issue')
-            # Image_4.png shows this raw capture works, but we'll soon refine it to use extracted Name/Car/Issue
-            supabase.table('leads').insert({"phone_number": num, "issue": msg}).execute()
-            print(f"🔥 LEAD CAPTURED: {num} for non-confirmed appt")
-        except Exception as e:
-            print(f"❌ SUPABASE LEAD ERROR: {e}")
-        # Strip the lead tag from the public reply
-        # Handle new lead tag structure [LEAD_CAPTURED: Name | Vehicle | Issue]
+            lead_content = bot_reply.split(f"{LEAD_TAG}: ")[1].split(']')[0].strip()
+            parts = [p.strip() for p in lead_content.split("|")]
+            
+            supabase.table('leads').insert({
+                "customer_name": parts[0] if len(parts) > 0 else "Unknown",
+                "phone_number": num,
+                "vehicle": parts[1] if len(parts) > 1 else "Unknown",
+                "issue": parts[2] if len(parts) > 2 else msg
+            }).execute()
+            print(f"🔥 CLEAN LEAD SAVED: {parts[0]}")
+        except: pass
         final_reply = bot_reply.split('[')[0].strip()
 
-    # PING TABLET (MacroDroid)
+    # PING TABLET
     requests.get(os.environ.get("MACRODROID_URL"), params={"number": num, "text": final_reply})
     return "OK", 200
 
