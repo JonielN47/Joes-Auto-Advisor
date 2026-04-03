@@ -63,7 +63,7 @@ def clean_tags(text):
 
 @app.route('/sms', methods=['POST', 'GET'])
 def handle_sms():
-    print("🔔 DOORBELL: Processing incoming message...")
+    print("🔔 DOORBELL: OpenAI is processing a request...")
     data = request.json if request.method == 'POST' else request.args
     msg = data.get('message', '')
     num = data.get('number', '')
@@ -73,103 +73,88 @@ def handle_sms():
     # 1. MEMORY: Save user text
     try:
         supabase.table('messages').insert({"phone_number": num, "role": "user", "content": msg}).execute()
-    except Exception as e:
-        print(f"⚠️ Supabase Memory Write Error: {e}")
+    except: pass
 
-    # 2. MEMORY: Get context (Now pulling 8 messages for deeper memory)
+    # 2. MEMORY: Get context (Last 8 messages)
     history_data = supabase.table('messages').select("role, content").eq("phone_number", num).order("created_at", desc=True).limit(8).execute()
     chat_history = [{"role": h['role'], "content": h['content']} for h in reversed(history_data.data)]
 
     now = datetime.now(TIMEZONE)
     system_prompt = f"""
-    You are the AI Assistant for Current Auto Care in Ephrata, PA. 
+    You are the Senior AI Coordinator for Current Auto Care in Ephrata, PA. 
     HOURS: Mon-Fri 7:00 AM - 5:30 PM. CLOSED Weekends.
     CURRENT TIME: {now.strftime('%A, %Y-%m-%d %I:%M %p')}
     
     GOAL:
     1. Collect Name, Car, and Issue.
-    2. ONCE you have Name/Car/Issue, add this tag: [{LEAD_TAG}: Name | Vehicle | Issue].
+    2. Once you have info, include this tag: [{LEAD_TAG}: Name | Vehicle | Issue].
     3. To book, use: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS | Service Name].
-    Keep your messages professional and helpful.
     """
 
-    # 3. CALL AI (With Retry Logic for High Traffic)
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    # 3. CALL PAID AI (OpenAI GPT-4o-mini via OpenRouter for high speed)
+    # This model is 10x faster than the Stepfun free version.
+    api_key = os.environ.get("OPENROUTER_API_KEY") 
     bot_reply = ""
-    for attempt in range(3): # Try up to 3 times
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": "stepfun/step-3.5-flash:free",
-                    "messages": [{"role": "system", "content": system_prompt}] + chat_history
-                },
-                timeout=25
-            )
-            if response.status_code == 200:
-                bot_reply = response.json()['choices'][0]['message']['content']
-                break
-            elif response.status_code == 429:
-                print(f"⏳ Busy! Retrying in 2 seconds... (Attempt {attempt+1})")
-                time.sleep(2)
-            else:
-                print(f"❌ AI Error {response.status_code}: {response.text}")
-        except Exception as e:
-            print(f"❌ AI Timeout/Crash: {e}")
-            time.sleep(1)
+    
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": "openai/gpt-4o-mini", # <--- THE TURBO UPGRADE
+                "messages": [{"role": "system", "content": system_prompt}] + chat_history,
+                "temperature": 0.5
+            },
+            timeout=15
+        )
+        if response.status_code == 200:
+            bot_reply = response.json()['choices'][0]['message']['content']
+        else:
+            print(f"❌ OpenAI Error: {response.text}")
+    except Exception as e:
+        print(f"❌ Request Failed: {e}")
 
     if not bot_reply:
-        bot_reply = "I'm experiencing a bit of a traffic jam! Could you repeat that for me?"
-
-    print(f"💬 AI REPLY: {bot_reply}")
+        bot_reply = "I'm having a quick connection issue—could you repeat that?"
 
     # --- LOGIC GATEKEEPER ---
     final_reply = clean_tags(bot_reply)
 
-    # Handle Booking
     if BOOKING_TAG in bot_reply:
         try:
             tag_content = bot_reply.split(f"{BOOKING_TAG}: ")[1].split(']')[0].strip()
-            time_str, service_name = tag_content.split("|") if "|" in tag_content else (tag_content, "General Service")
+            time_str, svc = tag_content.split("|") if "|" in tag_content else (tag_content, "General Service")
             req_time = parser.parse(time_str.strip(), fuzzy=True).replace(tzinfo=TIMEZONE)
-            req_time = req_time.replace(minute=0, second=0, microsecond=0)
+            req_time = req_time.replace(minute=0, second=0, microsecond=0) # MINUTE ERASER
             
             if is_slot_available(req_time):
-                create_booking(f"{service_name.strip()} - {num}", req_time, num)
-                final_reply += f" \n\n✅ Scheduled for {req_time.strftime('%b %d at %I:%M %p')}!"
-                # Clear memory after booking
+                create_booking(f"{svc.strip()} - {num}", req_time, num)
+                final_reply += f" \n\n✅ Confirmed for {req_time.strftime('%b %d at %I:%M %p')}!"
                 supabase.table('messages').delete().eq("phone_number", num).execute()
             else:
-                final_reply = "I'm sorry, that slot was just taken. Is there another time that works?"
-        except Exception as e:
-            print(f"❌ CALENDAR ERROR: {e}")
+                final_reply = "I'm sorry, that slot was just taken! Is there another time?"
+        except: pass
 
-    # Handle Lead Capture
-    if LEAD_TAG in bot_reply:
+    elif LEAD_TAG in bot_reply:
         try:
             lead_content = bot_reply.split(f"{LEAD_TAG}: ")[1].split(']')[0].strip()
-            parts = [p.strip() for p in lead_content.split("|")]
+            p = [i.strip() for i in lead_content.split("|")]
             supabase.table('leads').insert({
-                "customer_name": parts[0] if len(parts) > 0 else "Unknown",
+                "customer_name": p[0] if len(p)>0 else "Unknown",
                 "phone_number": num,
-                "vehicle": parts[1] if len(parts) > 1 else "Unknown",
-                "issue": parts[2] if len(parts) > 2 else msg
+                "vehicle": p[1] if len(p)>1 else "Unknown",
+                "issue": p[2] if len(p)>2 else msg
             }).execute()
-            print(f"🔥 LEAD SAVED: {parts[0]}")
-        except Exception as e:
-            print(f"❌ LEAD SAVE ERROR: {e}")
+        except: pass
+        final_reply = bot_reply.split('[')[0].strip()
 
-    # 4. MEMORY: Save final AI reply
+    # 4. MEMORY: Save final reply
     try:
         supabase.table('messages').insert({"phone_number": num, "role": "assistant", "content": final_reply}).execute()
-    except Exception as e:
-        print(f"⚠️ Memory Save Error: {e}")
+    except: pass
 
     # 5. PING TABLET
-    print(f"📱 TABLET: Sending: {final_reply}")
     requests.get(os.environ.get("MACRODROID_URL"), params={"number": num, "text": final_reply})
-    
     return "OK", 200
 
 if __name__ == "__main__":
