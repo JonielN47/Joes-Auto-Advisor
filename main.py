@@ -1,7 +1,8 @@
 import os
 import json
 import requests
-import re # Added for better tag cleaning
+import re
+import time
 from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -58,12 +59,11 @@ def create_booking(summary, start_time, phone):
     }).execute()
 
 def clean_tags(text):
-    """Removes any [TAG: ...] while keeping the rest of the text."""
     return re.sub(r'\[.*?\]', '', text).strip()
 
 @app.route('/sms', methods=['POST', 'GET'])
 def handle_sms():
-    print("🔔 DOORBELL: New text message received.")
+    print("🔔 DOORBELL: Processing incoming message...")
     data = request.json if request.method == 'POST' else request.args
     msg = data.get('message', '')
     num = data.get('number', '')
@@ -73,10 +73,11 @@ def handle_sms():
     # 1. MEMORY: Save user text
     try:
         supabase.table('messages').insert({"phone_number": num, "role": "user", "content": msg}).execute()
-    except: pass
+    except Exception as e:
+        print(f"⚠️ Supabase Memory Write Error: {e}")
 
-    # 2. MEMORY: Get conversation history
-    history_data = supabase.table('messages').select("role, content").eq("phone_number", num).order("created_at", desc=True).limit(6).execute()
+    # 2. MEMORY: Get context (Now pulling 8 messages for deeper memory)
+    history_data = supabase.table('messages').select("role, content").eq("phone_number", num).order("created_at", desc=True).limit(8).execute()
     chat_history = [{"role": h['role'], "content": h['content']} for h in reversed(history_data.data)]
 
     now = datetime.now(TIMEZONE)
@@ -92,22 +93,39 @@ def handle_sms():
     Keep your messages professional and helpful.
     """
 
-    # 3. CALL AI
+    # 3. CALL AI (With Retry Logic for High Traffic)
     api_key = os.environ.get("OPENROUTER_API_KEY")
-    ai_resp = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": "stepfun/step-3.5-flash:free",
-            "messages": [{"role": "system", "content": system_prompt}] + chat_history
-        }
-    ).json()
-    
-    bot_reply = ai_resp['choices'][0]['message']['content']
-    print(f"💬 AI FULL REPLY: {bot_reply}")
+    bot_reply = ""
+    for attempt in range(3): # Try up to 3 times
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "stepfun/step-3.5-flash:free",
+                    "messages": [{"role": "system", "content": system_prompt}] + chat_history
+                },
+                timeout=25
+            )
+            if response.status_code == 200:
+                bot_reply = response.json()['choices'][0]['message']['content']
+                break
+            elif response.status_code == 429:
+                print(f"⏳ Busy! Retrying in 2 seconds... (Attempt {attempt+1})")
+                time.sleep(2)
+            else:
+                print(f"❌ AI Error {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"❌ AI Timeout/Crash: {e}")
+            time.sleep(1)
+
+    if not bot_reply:
+        bot_reply = "I'm experiencing a bit of a traffic jam! Could you repeat that for me?"
+
+    print(f"💬 AI REPLY: {bot_reply}")
 
     # --- LOGIC GATEKEEPER ---
-    final_reply = clean_tags(bot_reply) # Start with clean text
+    final_reply = clean_tags(bot_reply)
 
     # Handle Booking
     if BOOKING_TAG in bot_reply:
@@ -120,13 +138,14 @@ def handle_sms():
             if is_slot_available(req_time):
                 create_booking(f"{service_name.strip()} - {num}", req_time, num)
                 final_reply += f" \n\n✅ Scheduled for {req_time.strftime('%b %d at %I:%M %p')}!"
+                # Clear memory after booking
                 supabase.table('messages').delete().eq("phone_number", num).execute()
             else:
                 final_reply = "I'm sorry, that slot was just taken. Is there another time that works?"
         except Exception as e:
-            print(f"❌ BOOKING ERROR: {e}")
+            print(f"❌ CALENDAR ERROR: {e}")
 
-    # Handle Lead Capture (Even if not booking)
+    # Handle Lead Capture
     if LEAD_TAG in bot_reply:
         try:
             lead_content = bot_reply.split(f"{LEAD_TAG}: ")[1].split(']')[0].strip()
@@ -144,13 +163,11 @@ def handle_sms():
     # 4. MEMORY: Save final AI reply
     try:
         supabase.table('messages').insert({"phone_number": num, "role": "assistant", "content": final_reply}).execute()
-    except: pass
+    except Exception as e:
+        print(f"⚠️ Memory Save Error: {e}")
 
     # 5. PING TABLET
-    if not final_reply:
-        final_reply = "I'm here to help! Could you please tell me your name and car model?"
-        
-    print(f"📱 TABLET: Sending text: {final_reply}")
+    print(f"📱 TABLET: Sending: {final_reply}")
     requests.get(os.environ.get("MACRODROID_URL"), params={"number": num, "text": final_reply})
     
     return "OK", 200
