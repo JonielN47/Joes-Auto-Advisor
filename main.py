@@ -15,7 +15,7 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 TIMEZONE = pytz.timezone("America/New_York")
 BOOKING_TAG = "CONFIRMED_BOOKING"
-DATA_TAG = "INTERNAL_DATA" # New hidden tag for incremental saving
+DATA_TAG = "INTERNAL_DATA"
 
 # Initialize Supabase
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
@@ -26,19 +26,22 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 def get_free_slots():
-    """Scans every business hour for the next 10 days to show the AI a full menu."""
+    """Scans the next 10 days and picks 3 diverse slots per day to give AI a broad menu."""
     service = get_calendar_service()
     now = datetime.now(TIMEZONE)
     slots = []
     
     for i in range(11):
         check_date = now + timedelta(days=i)
-        if check_date.weekday() >= 5: continue # Skip weekends
+        if check_date.weekday() == 6: continue # Skip Sundays
         
-        # Scan every hour from 7 AM to 4 PM
-        for hour in range(7, 17):
+        # Define hours based on Mel's actual schedule (Mon-Fri 9-5, Sat 9-2)
+        end_hour = 17 if check_date.weekday() < 5 else 14
+        day_slots_found = 0
+
+        for hour in range(9, end_hour):
             start = check_date.replace(hour=hour, minute=0, second=0, microsecond=0)
-            if start < now + timedelta(hours=1): continue 
+            if start < now + timedelta(hours=2): continue # Buffer for prep
             
             end = start + timedelta(hours=1)
             events = service.events().list(
@@ -50,16 +53,19 @@ def get_free_slots():
             
             if not events:
                 slots.append(start.strftime('%a, %b %d at %I:%M %p'))
-            if len(slots) >= 12: return slots # Give AI 12 choices across the week
-    return slots
+                day_slots_found += 1
+            
+            if day_slots_found >= 3: break # Grab 3 per day to keep the 'menu' diverse
+            
+    return slots[:15] # Return a solid top 15 list across the week
 
 def create_booking(summary, start_time, phone):
     service = get_calendar_service()
     end_time = start_time + timedelta(hours=1)
     event = {
         'summary': f"🚗 {summary}",
-        'location': '510 North Reading Road, Ephrata, PA 17522',
-        'description': f'Customer: {phone}\nSenior AI Booking',
+        'location': '101 Franklin St, West Reading, PA 19611',
+        'description': f'Customer: {phone}\nBerks Digital Partners AI Booking',
         'start': {'dateTime': start_time.isoformat(), 'timeZone': 'America/New_York'},
         'end': {'dateTime': end_time.isoformat(), 'timeZone': 'America/New_York'},
     }
@@ -69,7 +75,6 @@ def create_booking(summary, start_time, phone):
     }).execute()
 
 def clean_tags(text):
-    """Surgically removes both booking and data tags."""
     text = re.sub(r'\[CONFIRMED_BOOKING:.*?\]', '', text)
     text = re.sub(r'\[INTERNAL_DATA:.*?\]', '', text)
     return text.strip()
@@ -91,17 +96,22 @@ def handle_sms():
 
     now = datetime.now(TIMEZONE)
     system_prompt = f"""
-    You are the Senior Service Advisor for Current Auto Care.
-    SHOP: 510 N Reading Rd, Ephrata. HOURS: Mon-Fri 7am-5:30pm.
+    You are the Professional Service Advisor for Mel's Auto Service LLC.
+    SHOP: 101 Franklin St, West Reading, PA 19611. 
+    HOURS: Mon-Fri 9am-5pm, Sat 9am-2pm.
     CURRENT TIME: {now.strftime('%A, %b %d, %I:%M %p')}
 
+    PERSONA:
+    You represent Mel. You are honest, local, and trustworthy. We specialize in inspections, 
+    visual emissions, brakes, and general repairs. We treat customers like family.
+
     INSTRUCTIONS:
-    1. Every time you learn something (Name, Year, Make, Model, or Issue), you MUST include this hidden tag at the END of your message:
+    1. Every time you learn something (Name, Year, Make, Model, or Issue), you MUST include this hidden tag:
        [{DATA_TAG}: Name | Year | Make | Model | Issue]
-       Use 'None' for info you don't have yet.
-    2. Suggest from these openings, but you can book ANY weekday hour 7am-4pm:
+    2. Suggest from these openings (you can book ANY weekday 9am-4pm or Sat 9am-1pm):
        - {slots_str}
-    3. To finalize a booking, use: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS | Service Name]
+    3. You have full authority to book up to 10 days in advance. Do NOT limit customers to today.
+    4. To finalize a booking, use: [{BOOKING_TAG}: YYYY-MM-DDTHH:MM:SS | Service Name]
     """
 
     # 3. Call OpenAI
@@ -117,15 +127,12 @@ def handle_sms():
     ).json()
     
     bot_reply = ai_resp['choices'][0]['message']['content']
-    print(f"💬 AI REPLY: {bot_reply}")
 
-    # 4. Handle Incremental Data (The Supabase Fix)
+    # 4. Handle Incremental Data Update
     if DATA_TAG in bot_reply:
         try:
             raw_data = bot_reply.split(f"{DATA_TAG}: ")[1].split(']')[0].strip()
             p = [i.strip() for i in raw_data.split("|")]
-            
-            # This logic updates existing leads or creates new ones
             lead_payload = {
                 "phone_number": num,
                 "customer_name": p[0] if p[0] != "None" else None,
@@ -134,14 +141,9 @@ def handle_sms():
                 "model": p[3] if p[3] != "None" else None,
                 "issue": p[4] if p[4] != "None" else None
             }
-            # Remove None values so we don't overwrite good data with "None"
             lead_payload = {k: v for k, v in lead_payload.items() if v is not None}
-            
-            # UPSERT: Update if phone exists, otherwise insert
             supabase.table('leads').upsert(lead_payload, on_conflict='phone_number').execute()
-            print(f"💾 Incremental Lead Update for {num}")
-        except Exception as e:
-            print(f"❌ DATA SYNC ERROR: {e}")
+        except: pass
 
     # 5. Handle Final Booking
     final_reply = clean_tags(bot_reply)
@@ -151,7 +153,7 @@ def handle_sms():
             time_str, svc = tag.split("|") if "|" in tag else (tag, "Repair")
             req_time = parser.parse(time_str.strip(), fuzzy=True).replace(tzinfo=TIMEZONE).replace(minute=0, second=0)
             create_booking(f"{svc.strip()} - {num}", req_time, num)
-            final_reply += f" \n\n✅ I've got you down for {req_time.strftime('%b %d at %I:%M %p')}!"
+            final_reply += f" \n\n✅ I've got you down for {req_time.strftime('%b %d at %I:%M %p')} at 101 Franklin St!"
             supabase.table('messages').delete().eq("phone_number", num).execute()
         except: pass
 
